@@ -10,7 +10,8 @@ import {
   signInWithEmailAndPassword,
   sendPasswordResetEmail,
   sendEmailVerification,
-  updateProfile
+  updateProfile,
+  deleteUser
 } from 'firebase/auth';
 import { auth, googleProvider } from '@/lib/firebase';
 
@@ -20,15 +21,21 @@ interface AuthContextType {
   signInWithGoogle: () => Promise<void>;
   signInWithEmail: (email: string, password: string) => Promise<void>;
   signUpWithEmail: (email: string, password: string, displayName: string) => Promise<void>;
-  resendVerificationEmail: () => Promise<void>;
+  resendVerificationEmail: (email: string, password: string) => Promise<void>;
   resetPassword: (email: string) => Promise<void>;
   signOut: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-// Helper function to sync user with Supabase
+// Helper function to sync VERIFIED user with Supabase (only called after email verification)
 async function syncUserToSupabase(firebaseUser: User, authProvider: 'google' | 'email'): Promise<boolean> {
+  // IMPORTANT: Only sync verified users to database
+  if (!firebaseUser.emailVerified && authProvider === 'email') {
+    console.log('Skipping database sync - email not verified');
+    return false;
+  }
+
   try {
     const response = await fetch('/api/users', {
       method: 'POST',
@@ -38,7 +45,7 @@ async function syncUserToSupabase(firebaseUser: User, authProvider: 'google' | '
         email: firebaseUser.email,
         display_name: firebaseUser.displayName,
         photo_url: firebaseUser.photoURL,
-        is_verified: firebaseUser.emailVerified,
+        is_verified: true, // Only verified users reach this point
         auth_provider: authProvider,
       }),
     });
@@ -49,7 +56,7 @@ async function syncUserToSupabase(firebaseUser: User, authProvider: 'google' | '
       return false;
     }
     
-    console.log('User synced to Supabase successfully');
+    console.log('Verified user synced to Supabase successfully');
     return true;
   } catch (error) {
     console.error('Failed to sync user to Supabase:', error);
@@ -62,15 +69,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      setUser(user);
-      setLoading(false);
-      
-      // Sync verified users to Supabase on auth state change
-      if (user && user.emailVerified) {
-        const provider = user.providerData[0]?.providerId === 'google.com' ? 'google' : 'email';
-        await syncUserToSupabase(user, provider);
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      // Only set user if:
+      // 1. No user (logged out)
+      // 2. Google user (always verified)
+      // 3. Email user with verified email
+      if (!firebaseUser) {
+        setUser(null);
+        setLoading(false);
+        return;
       }
+
+      const isGoogleUser = firebaseUser.providerData[0]?.providerId === 'google.com';
+      const isVerified = firebaseUser.emailVerified;
+
+      if (isGoogleUser || isVerified) {
+        setUser(firebaseUser);
+        // Sync verified users to Supabase
+        const provider = isGoogleUser ? 'google' : 'email';
+        await syncUserToSupabase(firebaseUser, provider);
+      } else {
+        // Email user but not verified - don't set as logged in user
+        // Sign them out to prevent any access
+        await firebaseSignOut(auth);
+        setUser(null);
+      }
+      
+      setLoading(false);
     });
 
     return () => unsubscribe();
@@ -108,24 +133,82 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signUpWithEmail = async (email: string, password: string, displayName: string) => {
     try {
-      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      // Try to create user in Firebase
+      // If email already exists but not verified, Firebase will throw 'auth/email-already-in-use'
+      // We handle this by trying to sign in and resend verification
+      let userCredential;
+      
+      try {
+        userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      } catch (createError: unknown) {
+        const error = createError as { code?: string };
+        
+        // If email already in use, check if it's an unverified account
+        if (error.code === 'auth/email-already-in-use') {
+          try {
+            // Try to sign in with the provided credentials
+            const existingUser = await signInWithEmailAndPassword(auth, email, password);
+            
+            if (!existingUser.user.emailVerified) {
+              // Unverified account exists - resend verification email
+              await sendEmailVerification(existingUser.user, {
+                url: window.location.origin + '/login',
+              });
+              await firebaseSignOut(auth);
+              throw { 
+                code: 'auth/verification-resent', 
+                message: 'An unverified account exists. We\'ve resent the verification email. Please check your inbox.' 
+              };
+            } else {
+              // Account is already verified - they should login instead
+              await firebaseSignOut(auth);
+              throw { 
+                code: 'auth/email-already-in-use', 
+                message: 'An account with this email already exists. Please login instead.' 
+              };
+            }
+          } catch (signInError: unknown) {
+            const sError = signInError as { code?: string; message?: string };
+            // If sign in failed (wrong password), show appropriate error
+            if (sError.code === 'auth/wrong-password' || sError.code === 'auth/invalid-credential') {
+              throw { 
+                code: 'auth/email-already-in-use', 
+                message: 'An account with this email already exists. Please login or reset your password.' 
+              };
+            }
+            // Re-throw verification-resent error
+            if (sError.code === 'auth/verification-resent') {
+              throw sError;
+            }
+            throw createError; // Re-throw original error
+          }
+        }
+        throw createError;
+      }
+      
       await updateProfile(userCredential.user, { displayName });
       
-      // Save user to Supabase (not verified yet)
-      await syncUserToSupabase(userCredential.user, 'email');
+      // DO NOT save to Supabase yet - user is not verified
+      // User will be saved on first successful verified login
       
-      // Send verification email - must be done while user is still signed in
+      // Send verification email
       try {
         await sendEmailVerification(userCredential.user, {
-          url: window.location.origin + '/login', // Redirect URL after verification
+          url: window.location.origin + '/login',
         });
         console.log('Verification email sent successfully to:', email);
       } catch (emailError) {
         console.error('Failed to send verification email:', emailError);
-        // Don't throw here - account is created, just email failed
+        // Delete the Firebase user since we couldn't send verification email
+        try {
+          await deleteUser(userCredential.user);
+        } catch (deleteError) {
+          console.error('Failed to delete user after email send failure:', deleteError);
+        }
+        throw { code: 'auth/email-send-failed', message: 'Failed to send verification email. Please try again.' };
       }
       
-      // Sign out after sending verification email
+      // Sign out - user must verify email before they can use the account
       await firebaseSignOut(auth);
     } catch (error) {
       console.error('Error signing up with email:', error);
@@ -133,11 +216,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const resendVerificationEmail = async () => {
+  const resendVerificationEmail = async (email: string, password: string) => {
     try {
-      if (auth.currentUser) {
-        await sendEmailVerification(auth.currentUser);
+      // Sign in temporarily to resend verification email
+      const userCredential = await signInWithEmailAndPassword(auth, email, password);
+      
+      if (userCredential.user.emailVerified) {
+        await firebaseSignOut(auth);
+        throw { code: 'auth/already-verified', message: 'Your email is already verified. Please login.' };
       }
+      
+      await sendEmailVerification(userCredential.user, {
+        url: window.location.origin + '/login',
+      });
+      
+      await firebaseSignOut(auth);
     } catch (error) {
       console.error('Error sending verification email:', error);
       throw error;

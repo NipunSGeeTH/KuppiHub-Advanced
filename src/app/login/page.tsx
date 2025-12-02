@@ -10,7 +10,7 @@ type AuthMode = "login" | "signup" | "reset" | "verify-email";
 
 export default function LoginPage() {
   const router = useRouter();
-  const { user, loading, signInWithGoogle, signInWithEmail, signUpWithEmail, resetPassword } = useAuth();
+  const { user, loading, signInWithGoogle, signInWithEmail, signUpWithEmail, resendVerificationEmail, resetPassword } = useAuth();
   
   const [mode, setMode] = useState<AuthMode>("login");
   const [email, setEmail] = useState("");
@@ -82,10 +82,11 @@ export default function LoginPage() {
           setError("No account found with this email");
           break;
         case "auth/wrong-password":
+        case "auth/invalid-credential":
           setError("Incorrect password");
           break;
         case "auth/email-already-in-use":
-          setError("An account already exists with this email");
+          setError(error.message || "An account already exists with this email");
           break;
         case "auth/weak-password":
           setError("Password is too weak. Use at least 6 characters");
@@ -98,9 +99,48 @@ export default function LoginPage() {
           break;
         case "auth/email-not-verified":
           setError(error.message || "Please verify your email before signing in.");
+          setMode("verify-email");
+          break;
+        case "auth/verification-resent":
+          setSuccess(error.message || "Verification email resent. Please check your inbox.");
+          setMode("verify-email");
+          break;
+        case "auth/already-verified":
+          setSuccess(error.message || "Your email is already verified. Please login.");
+          setMode("login");
+          break;
+        case "auth/email-send-failed":
+          setError(error.message || "Failed to send verification email. Please try again.");
           break;
         default:
           setError(error.message || "An error occurred. Please try again");
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleResendVerification = async () => {
+    if (!email || !password) {
+      setError("Please enter your email and password to resend verification.");
+      return;
+    }
+    setIsSubmitting(true);
+    setError("");
+    try {
+      await resendVerificationEmail(email, password);
+      setSuccess("Verification email sent! Please check your inbox.");
+    } catch (err: unknown) {
+      const error = err as { code?: string; message?: string };
+      if (error.code === "auth/wrong-password" || error.code === "auth/invalid-credential") {
+        setError("Incorrect password. Please enter the correct password to resend verification.");
+      } else if (error.code === "auth/already-verified") {
+        setSuccess(error.message || "Your email is already verified!");
+        setMode("login");
+      } else if (error.code === "auth/too-many-requests") {
+        setError("Too many attempts. Please wait a few minutes before trying again.");
+      } else {
+        setError(error.message || "Failed to resend verification email.");
       }
     } finally {
       setIsSubmitting(false);
@@ -197,10 +237,42 @@ export default function LoginPage() {
                 </svg>
               </div>
               <h3 className="text-lg font-semibold text-gray-900 mb-2">Check Your Email</h3>
-              <p className="text-gray-600 mb-6">
-                We&apos;ve sent a verification link to <strong>{email}</strong>. 
+              <p className="text-gray-600 mb-4">
+                We&apos;ve sent a verification link to <strong>{email || "your email"}</strong>. 
                 Please click the link to verify your email address.
               </p>
+              
+              {/* Resend verification section */}
+              <div className="bg-gray-50 rounded-lg p-4 mb-4">
+                <p className="text-sm text-gray-600 mb-3">Didn&apos;t receive the email?</p>
+                <div className="space-y-2">
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="Enter your email"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 
+                             focus:border-transparent text-gray-900"
+                  />
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Enter your password"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 
+                             focus:border-transparent text-gray-900"
+                  />
+                  <button
+                    onClick={handleResendVerification}
+                    disabled={isSubmitting}
+                    className="w-full py-2 px-4 bg-gray-200 text-gray-700 font-medium rounded-lg
+                             hover:bg-gray-300 transition-all duration-200 text-sm disabled:opacity-50"
+                  >
+                    {isSubmitting ? "Sending..." : "Resend Verification Email"}
+                  </button>
+                </div>
+              </div>
+              
               <button
                 onClick={() => switchMode("login")}
                 className="w-full py-3 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-semibold 
@@ -210,7 +282,7 @@ export default function LoginPage() {
                 Back to Login
               </button>
               <p className="text-sm text-gray-500 mt-4">
-                Didn&apos;t receive the email? Check your spam folder or try signing up again.
+                Check your spam folder if you don&apos;t see the email.
               </p>
             </div>
           )}
